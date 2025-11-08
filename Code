@@ -1,0 +1,242 @@
+/*****************************************************************************************
+ *  PROJEKT:  ESP32 Heating Hub – simulace řízení kotle a hlavic (zón)
+ *  VERZE:    v4 (kompaktní UI, opravy rozložení, 5 místností)
+ *
+ *  ZMĚNY V4:
+ *   - Kompaktní karty místností vedle sebe (responsive grid, auto-fit)
+ *   - Hlavička kotle bez T vody a čerpadla (jen kotel + band + metriky)
+ *   - „Topení/Stání“ → „Ventil: Otevřen/Zavřen“
+ *   - Opraven overflow/overlay UI (flex-wrap, menší inputy, 2 řádky v kartě)
+ *   - Výchozí počet místností 5 (snadné rozšíření úpravou ROOM_COUNT + pole rooms[])
+ *****************************************************************************************/
+
+/*********************************** BLOK A – ZÁKLADNÍ INCLUDE & DEFINICE *****************/
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ArduinoJson.h>
+
+// ===== Konfigurace =====
+#define BOILER_RELAY 5                  // výstup pro kotel (simulace – jen log. stav)
+#define ROOM_COUNT 5                    // *** ZDE změň počet místností ***
+#define HISTORY_LEN 180                 // počet vzorků pro graf (cca 3 h při 1 min/krok)
+
+/*********************************** BLOK B – HTML UI (PROGMEM) ***************************/
+static const char INDEX_HTML[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang=cs>
+<head>
+<meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>Topný systém – hlavní jednotka</title>
+<style>
+:root{--bg:#0e0f13;--card:#141826;--muted:#8a94a7;--text:#e8edf5;--accent:#5491ff;--ok:#2ecc71;--warn:#f39c12;--err:#e74c3c;--border:#212a3b;--chip:#0f1420;--chip-b:#263146;--radius:16px;--shadow:0 8px 28px rgba(0,0,0,.35)}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{margin:0;font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Cantarell,\"Helvetica Neue\",Arial;color:var(--text);background:linear-gradient(180deg,#0e0f13 0%,#0c0d11 100%)}
+a{color:var(--accent);text-decoration:none}
+header{position:sticky;top:0;z-index:10;backdrop-filter:saturate(180%) blur(8px);background:rgba(12,13,17,.7);border-bottom:1px solid var(--border)}
+.wrap{max-width:1200px;margin:0 auto;padding:16px}
+h1{margin:0;font-size:20px;letter-spacing:.2px}
+.grid{display:grid;gap:16px;grid-template-columns:repeat(12,1fr)}
+.card{grid-column:span 12;background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:16px;box-shadow:var(--shadow)}
+.row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.spacer{flex:1}
+.muted{color:var(--muted)}
+.chip{display:inline-flex;align-items:center;gap:8px;padding:6px 10px;border-radius:999px;border:1px solid var(--chip-b);background:var(--chip);font-weight:600}
+.chip.ok{color:#bffad2;border-color:#224a33;background:#122418}
+.chip.off{color:#ffcabf;border-color:#4a2222;background:#211112}
+.pill{border-radius:999px;padding:4px 8px;border:1px solid #2a3446;background:#0f1420;font-weight:600}
+.pill.open{border-color:#224a33;background:#132a1c;color:#bffad2}
+.pill.closed{border-color:#4a3a22;background:#2a1f12;color:#ffe3b8}
+button,input,select{color:var(--text);background:#0f1420;border:1px solid #2a3446;border-radius:12px;padding:8px 10px}
+button{cursor:pointer;font-weight:600}
+button.primary{background:var(--accent);border-color:transparent;color:#fff}
+button.ghost{background:#0f1420}
+button:disabled{opacity:.5;cursor:not-allowed}
+input[type=number]{width:76px}
+input[type=text]{width:150px}
+label.lbl{display:inline-flex;align-items:center;gap:8px}
+.metrics{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}
+.metric{padding:10px 12px;border:1px solid var(--border);background:#0f1420;border-radius:12px;text-align:center}
+.metric .v{font-size:18px;font-weight:700}
+.metric .k{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}
+/* === Kompaktní mřížka místností === */
+.room-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:14px}
+.room{display:flex;flex-direction:column;gap:10px;background:var(--card);border:1px solid var(--border);border-radius:14px;padding:12px;box-shadow:var(--shadow)}
+.room-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.room-head h3{margin:0;font-size:15px}
+.room-body{display:flex;flex-direction:column;gap:10px}
+.kv{display:grid;grid-template-columns:110px 1fr;gap:6px;align-items:center}
+.kv .k{color:var(--muted)}
+canvas.chart{width:100%;height:140px;display:block;border-radius:10px;background:#0f1420;border:1px solid #2a3446}
+.footer{opacity:.7;font-size:12px;text-align:center;padding:16px}
+summary{cursor:pointer;color:var(--muted)}
+</style>
+</head>
+<body>
+<header>
+  <div class=wrap>
+    <div class=row>
+      <h1>Topný systém – hlavní jednotka</h1>
+      <span class=spacer></span>
+      <span id=lastSync class=muted>Naposledy: –</span>
+    </div>
+  </div>
+</header>
+<main class=wrap>
+  <section class=card id=boilerCard>
+    <div class=row style=gap:12px>
+      <span id=boilerChip class="chip off">Kotel: Vypnuto</span>
+      <span id=bandPill class=pill>Comfort band: – °C</span>
+      <span class=spacer></span>
+      <button id=toggleBoiler class=primary>Přepnout kotel</button>
+      <label class=lbl>Comfort band <input id=comfortBand type=number step=0.1 min=0 max=5 value=2.0></label>
+      <button id=saveComfort class=ghost>Uložit</button>
+    </div>
+    <div class=metrics style=margin-top:12px>
+      <div class=metric><div class=v id=m_rooms>–</div><div class=k>Místností</div></div>
+      <div class=metric><div class=v id=m_active>–</div><div class=k>Ventilů otevřených</div></div>
+      <div class=metric><div class=v id=m_uptime>–</div><div class=k>Uptime</div></div>
+      <div class=metric><div class=v id=m_net>–</div><div class=k>Síť</div></div>
+    </div>
+    <details class=settings>
+      <summary>Nastavení a diagnostika</summary>
+      <div class=row style="margin-top:10px;gap:12px">
+        <label class=lbl>Y-rozsah (°C)
+          <input id=yMin type=number step=0.5 value=16> –
+          <input id=yMax type=number step=0.5 value=24>
+        </label>
+        <label class=lbl>Obnova dat
+          <select id=refreshRate>
+            <option value=0>Vypnuto</option>
+            <option value=750>0,75 s</option>
+            <option value=1000 selected>1 s</option>
+            <option value=2000>2 s</option>
+            <option value=3000>3 s</option>
+            <option value=5000>5 s</option>
+            <option value=10000>10 s</option>
+          </select>
+        </label>
+        <button id=refresh class=ghost>Ruční aktualizace</button>
+      </div>
+    </details>
+  </section>
+
+  <section class="room-grid" id=rooms></section>
+</main>
+<div class=footer>Modulární šablona • kompaktní karty • Canvas 2D grafy • vstupy se při editaci nepřepisují</div>
+
+<script>
+(()=>{
+  /* ===== Utilty a API ===== */
+  const API={state:'/api/state',toggleBoiler:'/api/boiler/toggle',comfort:'/api/comfort_band',setRoom:'/api/set_room',boost:'/api/boost'};
+  const $=(s,r=document)=>r.querySelector(s); const $$=(s,r=document)=>Array.from(r.querySelectorAll(s));
+  const now=()=>Date.now(); const fmt=(n,d=1)=>(n==null||Number.isNaN(n))?'–':Number(n).toFixed(d);
+  const fmtUptime=(ms)=>{if(ms==null)return '–';const s=Math.floor(ms/1000);const d=Math.floor(s/86400);const h=Math.floor((s%86400)/3600);const m=Math.floor((s%3600)/60);return `${d}d ${h}h ${m}m`};
+  const debounce=(fn,ms=250)=>{let t;return(...a)=>{clearTimeout(t);t=setTimeout(()=>fn(...a),ms)}}; const dpr=window.devicePixelRatio||1;
+  async function getJSON(u){const r=await fetch(u,{cache:'no-store'}); if(!r.ok) throw new Error(r.status+':'+u); return r.json();}
+  async function postJSON(u,d){const r=await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)}); if(!r.ok) throw new Error(r.status+':'+u); return r.json().catch(()=>({}));}
+
+  /* ===== Jednoduchý line chart ===== */
+  class LineChart{ constructor(c,o={}){this.c=c;this.ctx=c.getContext('2d');this.o=Object.assign({pad:{l:34,t:12,r:10,b:24},font:'11px system-ui',grid:'#1f2a3b',text:'#8a94a7',line:'#5491ff'},o); this.resize(); window.addEventListener('resize',debounce(()=>this.resize(),120));}
+    resize(){const r=this.c.getBoundingClientRect(); this.c.width=Math.max(240,Math.floor(r.width*dpr)); this.c.height=Math.max(120,Math.floor(r.height*dpr)); this.ctx.setTransform(dpr,0,0,dpr,0,0); this.draw();}
+    setData(s){this.s=s||[]; this.draw();}
+    setRange(xmin,xmax,ymin,ymax){this.xmin=xmin;this.xmax=xmax;this.ymin=ymin;this.ymax=ymax;this.draw();}
+    draw(){const ctx=this.ctx,{pad,font,grid,text}=this.o; const W=this.c.clientWidth,H=this.c.clientHeight; ctx.clearRect(0,0,W,H); ctx.save(); ctx.translate(.5,.5); ctx.font=font; ctx.fillStyle=text; ctx.strokeStyle=grid; ctx.lineWidth=1; const xl=pad.l,xr=W-pad.r,yt=pad.t,yb=H-pad.b; const plotW=xr-xl,plotH=yb-yt; if(plotW<=0||plotH<=0){ctx.restore();return;} const s=this.s&&this.s[0]?this.s[0].data:[]; const xmin=this.xmin??(s.length?s[0].t:now()-1800000); const xmax=this.xmax??(s.length?s[s.length-1].t:now()); const ymin=(this.ymin??16),ymax=(this.ymax??24); const xt=v=>xl+((v-xmin)/(xmax-xmin||1))*plotW; const ytpx=v=>yb-((v-ymin)/(ymax-ymin||1))*plotH; const yStep=chooseNiceStep(ymin,ymax,3,6); for(let y=Math.ceil(ymin/yStep)*yStep;y<=ymax;y+=yStep){const py=Math.round(ytpx(y)); ctx.beginPath(); ctx.moveTo(xl,py); ctx.lineTo(xr,py); ctx.stroke(); ctx.fillText(`${y.toFixed(0)}°C`,6,py-3);} const xStep=chooseTimeStep(xmin,xmax); for(let t=Math.ceil(xmin/xStep)*xStep;t<=xmax;t+=xStep){const px=Math.round(xt(t)); ctx.beginPath(); ctx.moveTo(px,yt); ctx.lineTo(px,yb); ctx.stroke(); const lab=timeLabel(t); const tw=ctx.measureText(lab).width; ctx.fillText(lab,Math.max(xl,Math.min(px-tw/2,xr-tw)),yb+14);} ctx.strokeStyle=grid; ctx.strokeRect(xl,yt,plotW,plotH); (this.s||[]).forEach(s=>{ctx.beginPath(); s.data.forEach((p,i)=>{const x=xt(p.t),y=ytpx(p.y); if(i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);}); ctx.strokeStyle='#5491ff'; ctx.lineWidth=1.8; ctx.stroke();}); ctx.restore(); }
+  }
+  function chooseNiceStep(min,max,minT,maxT){const span=Math.max(1e-9,max-min); const raw=span/((minT+maxT)/2); const mag=Math.pow(10,Math.floor(Math.log10(raw))); const norm=raw/mag; let step; if(norm<1.5) step=1; else if(norm<3) step=2; else if(norm<7) step=5; else step=10; return step*mag;}
+  function chooseTimeStep(xmin,xmax){const span=Math.max(1e3,xmax-xmin); const c=[60e3,2*60e3,5*60e3,10*60e3,15*60e3,30*60e3,60*60e3]; for(const k of c){if(span/k<=6) return k;} return c[c.length-1];}
+  function timeLabel(t){const d=new Date(t);const h=String(d.getHours()).padStart(2,'0');const m=String(d.getMinutes()).padStart(2,'0');return `${h}:${m}`}
+
+  /* ===== Karta místnosti (kompaktní) ===== */
+  class RoomCard{
+    constructor(room,index,host){this.index=index;this.host=host;this.el=this.build(room);this.editing=false;this.chart=new LineChart($('canvas',this.el));}
+    build(r){const el=document.createElement('article'); el.className='room'; el.innerHTML=`
+      <div class=room-head>
+        <h3><input class=name type=text value="${r.name}"></h3>
+        <span class="pill ${r.heating?'open':'closed'}" data-role=valvePill>Ventil: ${r.heating?'Otevřen':'Zavřen'}</span>
+      </div>
+      <div class=room-body>
+        <div class=kv><div class=k>Aktuální</div><div class=v><span data-role=tNow>${fmt(r.temp)}</span> °C</div></div>
+        <div class=kv><div class=k>Cílová</div><div class=v><input class=target type=number step=0.1 min=10 max=30 value=${fmt(r.target)}> °C</div></div>
+        <div class=kv><div class=k>Δ</div><div class=v><span data-role=delta>${fmt((r.temp??0)-(r.target??0))}</span> °C</div></div>
+        <div class=kv><div class=k>Povoleno</div><div class=v><input class=enabled type=checkbox ${r.enabled?'checked':''}></div></div>
+        <div class=row style=gap:8px>
+          <button class=ghost data-role=boost>Boost 15 min</button>
+          <button class=primary data-role=save>Uložit</button>
+        </div>
+        <canvas class=chart></canvas>
+      </div>`; el.addEventListener('focusin',()=>this.editing=true); el.addEventListener('focusout',()=>setTimeout(()=>this.editing=false,120)); $('button[data-role=save]',el).addEventListener('click',async()=>{const p=this.collect();p.index=this.index;try{await postJSON(API.setRoom,p);this.host.requestRefresh();}catch(e){console.warn(e);}}); $('button[data-role=boost]',el).addEventListener('click',async()=>{try{await postJSON(API.boost,{index:this.index,minutes:15});this.host.requestRefresh();}catch(e){console.warn(e);}}); return el;}
+    collect(){return {name:$('.name',this.el).value,target:Number($('.target',this.el).value),enabled:$('.enabled',this.el).checked};}
+    update(r,ymin,ymax){$('[data-role=tNow]',this.el).textContent=fmt(r.temp); $('[data-role=delta]',this.el).textContent=fmt((r.temp??0)-(r.target??0)); const pill=$('[data-role=valvePill]',this.el); pill.textContent='Ventil: '+(r.heating?'Otevřen':'Zavřen'); pill.classList.toggle('open',!!r.heating); pill.classList.toggle('closed',!r.heating); if(!this.editing){$('.name',this.el).value=r.name; $('.target',this.el).value=fmt(r.target); $('.enabled',this.el).checked=!!r.enabled;} const series=normalizeHistory(r.history,r.temp); this.chart.setRange(series.xmin,series.xmax,ymin,ymax); this.chart.setData([{name:'T',data:series.points}]);}
+  }
+  function normalizeHistory(h,fallback){const pts=[]; let xmin=now()-30*60e3,xmax=now(); if(Array.isArray(h)&&h.length){ if(typeof h[0]==='number'){const dt=60e3; const start=now()-(h.length-1)*dt; h.forEach((y,i)=>pts.push({t:start+i*dt,y}));} else if(typeof h[0]==='object'&&'t'in h[0]&&'y'in h[0]){h.forEach(p=>pts.push({t:p.t,y:p.y}));} xmin=pts[0]?.t??xmin; xmax=pts[pts.length-1]?.t??xmax; } else { const dt=60e3; const start=now()-30*dt; for(let i=0;i<=30;i++) pts.push({t:start+i*dt,y:fallback??20}); xmin=pts[0].t; xmax=pts[pts.length-1].t; } return {points:pts,xmin,xmax};}
+
+  /* ===== Aplikace ===== */
+  class App{ constructor(){this.state=null;this.timer=null;this.rooms=[];this.ymin=16;this.ymax=24;} async init(){this.bind(); await this.refresh(true); this.startTimer(Number($('#refreshRate').value||1000));} bind(){ $('#refresh').addEventListener('click',()=>this.refresh()); $('#refreshRate').addEventListener('change',e=>this.startTimer(Number(e.target.value))); $('#toggleBoiler').addEventListener('click',async()=>{try{await postJSON(API.toggleBoiler,{});this.refresh();}catch(e){console.warn(e);}}); $('#saveComfort').addEventListener('click',async()=>{const v=Number($('#comfortBand').value); try{await postJSON(API.comfort,{value:v}); this.refresh();}catch(e){console.warn(e);}}); $('#yMin').addEventListener('change',()=>{this.ymin=Number($('#yMin').value); this.renderRooms();}); $('#yMax').addEventListener('change',()=>{this.ymax=Number($('#yMax').value); this.renderRooms();}); }
+    startTimer(ms){ if(this.timer) clearInterval(this.timer); if(ms>0) this.timer=setInterval(()=>this.refresh(),ms); }
+    requestRefresh(){ this.refresh(); }
+    async refresh(first=false){ try{const s=await getJSON(API.state); this.state=s; this.renderHeader(); this.syncRooms(first); $('#lastSync').textContent='Naposledy: '+new Date().toLocaleTimeString(); }catch(e){console.warn(e); $('#lastSync').textContent='Chyba spojení';} }
+    renderHeader(){ const s=this.state||{}; const on=!!s.boiler_on; const chip=$('#boilerChip'); chip.classList.toggle('ok',on); chip.classList.toggle('off',!on); chip.textContent='Kotel: '+(on?'Zapnuto':'Vypnuto'); $('#bandPill').textContent='Comfort band: '+fmt(s.comfort_band||2)+' °C'; $('#comfortBand').value=fmt(s.comfort_band||2,1); $('#m_rooms').textContent=(s.rooms||[]).length; $('#m_active').textContent=(s.rooms||[]).filter(r=>r.heating).length; const net=s.net||{}; const netStr=[net.ssid?`Wi‑Fi: ${net.ssid}`:null, net.ip?`IP: ${net.ip}`:null, (net.rssi!=null)?`RSSI: ${net.rssi} dBm`:null].filter(Boolean).join(' · '); $('#m_net').textContent=netStr||'–'; $('#m_uptime').textContent=fmtUptime(s.uptime_ms); }
+    syncRooms(first){ const s=this.state||{rooms:[]}; const cont=$('#rooms'); if(first){ cont.innerHTML=''; this.rooms=[]; } s.rooms.forEach((r,i)=>{ if(!this.rooms[i]){ const c=new RoomCard(r,i,this); this.rooms[i]=c; cont.appendChild(c.el);} this.rooms[i].update(r,this.ymin,this.ymax);}); for(let i=s.rooms.length;i<this.rooms.length;i++){ this.rooms[i].el.remove(); } this.rooms.length=s.rooms.length; }
+    renderRooms(){ const s=this.state||{rooms:[]}; s.rooms.forEach((r,i)=> this.rooms[i]?.update(r,this.ymin,this.ymax)); }
+  }
+  const app=new App(); window.addEventListener('DOMContentLoaded',()=>app.init());
+})();
+</script>
+</body></html>
+)rawliteral";
+
+/*********************************** BLOK C – DATOVÉ STRUKTURY ****************************/
+struct Room{ // heating == ventil otevřen
+  String name; float temp; float target; bool heating; bool enabled; float history[HISTORY_LEN]; unsigned long boostUntil;
+};
+
+// Výchozí zóny (5 ks) – pro přidání stačí rozšířit pole a změnit ROOM_COUNT
+Room rooms[ROOM_COUNT]={
+  {"Obývák",   20.2f, 21.5f, false, true, {0}, 0},
+  {"Kuchyň",   19.8f, 20.5f, false, true, {0}, 0},
+  {"Ložnice",  19.5f, 20.0f, false, true, {0}, 0},
+  {"Pracovna", 20.0f, 20.5f, false, true, {0}, 0},
+  {"Koupelna", 22.0f, 23.0f, false, true, {0}, 0}
+};
+
+/*********************************** BLOK D – GLOBÁLNÍ STAV SYSTÉMU ************************/
+WebServer server(80);
+bool  boilerOn=false; bool pumpOn=false; float boilerTemp=45.0f; float comfortBand=2.0f;
+unsigned long uptimeStart=0,lastSim=0,lastLogic=0;
+
+/*********************************** BLOK E – POMOCNÉ FUNKCE ********************************/
+static inline float clampf(float v,float a,float b){return v<a?a:(v>b?b:v);} 
+void initHistory(){ for(int i=0;i<ROOM_COUNT;i++) for(int h=0;h<HISTORY_LEN;h++) rooms[i].history[h]=rooms[i].temp; }
+void addCORS(){ server.sendHeader("Access-Control-Allow-Origin","*"); server.sendHeader("Access-Control-Allow-Headers","Content-Type"); server.sendHeader("Access-Control-Allow-Methods","GET,POST,OPTIONS"); }
+
+/*********************************** BLOK F – SIMULACE A LOGIKA *****************************/
+void simulateTemperatures(){
+  for(int i=0;i<ROOM_COUNT;i++){
+    Room &r=rooms[i];
+    if(!r.enabled){ r.heating=false; for(int h=0;h<HISTORY_LEN-1;h++) r.history[h]=r.history[h+1]; r.history[HISTORY_LEN-1]=r.temp; continue; }
+    const float halfBand=comfortBand*0.5f; bool shouldOpen=r.heating;
+    if(millis()<r.boostUntil) shouldOpen=true; else { if(r.temp<r.target-halfBand) shouldOpen=true; if(r.temp>r.target+halfBand) shouldOpen=false; }
+    if(r.heating && !shouldOpen) r.temp+=0.5f; // dojezd
+    r.heating=shouldOpen; const float drift=r.heating?+0.36f:-0.06f; r.temp=clampf(r.temp+drift,16.0f,24.0f);
+    for(int h=0;h<HISTORY_LEN-1;h++) r.history[h]=r.history[h+1]; r.history[HISTORY_LEN-1]=r.temp;
+  }
+}
+void evaluateBoiler(){ bool anyOpen=false; for(int i=0;i<ROOM_COUNT;i++) if(rooms[i].enabled && rooms[i].heating){ anyOpen=true; break; } boilerOn=anyOpen; pumpOn=anyOpen; boilerTemp=clampf(boilerTemp+(anyOpen?+0.4f:-0.25f),25.0f,65.0f); digitalWrite(BOILER_RELAY,boilerOn?HIGH:LOW); }
+
+/*********************************** BLOK G – REST API **************************************/
+void apiState(){ addCORS(); DynamicJsonDocument doc(16384); doc["boiler_on"]=boilerOn; doc["pump_on"]=pumpOn; doc["boiler_temp"]=boilerTemp; doc["comfort_band"]=comfortBand; doc["uptime_ms"]=millis()-uptimeStart; JsonObject net=doc.createNestedObject("net"); net["ssid"]="ESP32_HeatingHub"; net["ip"]=WiFi.softAPIP().toString(); net["rssi"]=-50; JsonArray jRooms=doc.createNestedArray("rooms"); for(int i=0;i<ROOM_COUNT;i++){ JsonObject jr=jRooms.createNestedObject(); jr["name"]=rooms[i].name; jr["temp"]=rooms[i].temp; jr["target"]=rooms[i].target; jr["enabled"]=rooms[i].enabled; jr["heating"]=rooms[i].heating; JsonArray h=jr.createNestedArray("history"); for(int k=0;k<HISTORY_LEN;k++) h.add(rooms[i].history[k]); } String json; serializeJson(doc,json); server.send(200,"application/json",json); }
+void apiSetRoom(){ addCORS(); if(!server.hasArg("plain")){ server.send(400,"text/plain","Missing body"); return;} DynamicJsonDocument d(512); if(deserializeJson(d,server.arg("plain"))){ server.send(400,"text/plain","Bad JSON"); return;} int idx=d["index"]|-1; if(idx<0||idx>=ROOM_COUNT){ server.send(400,"text/plain","Bad index"); return;} if(d.containsKey("name")) rooms[idx].name=(const char*)d["name"]; if(d.containsKey("target")) rooms[idx].target=d["target"].as<float>(); if(d.containsKey("enabled")) rooms[idx].enabled=d["enabled"].as<bool>(); server.send(200,"application/json","{\"ok\":true}"); }
+void apiToggleBoiler(){ addCORS(); boilerOn=!boilerOn; pumpOn=boilerOn; server.send(200,"application/json","{\"ok\":true}"); }
+void apiComfort(){ addCORS(); if(!server.hasArg("plain")){ server.send(400,"text/plain","Missing body"); return;} DynamicJsonDocument d(256); if(deserializeJson(d,server.arg("plain"))){ server.send(400,"text/plain","Bad JSON"); return;} comfortBand=d["value"].as<float>(); server.send(200,"application/json","{\"ok\":true}"); }
+void apiBoost(){ addCORS(); if(!server.hasArg("plain")){ server.send(400,"text/plain","Missing body"); return;} DynamicJsonDocument d(256); if(deserializeJson(d,server.arg("plain"))){ server.send(400,"text/plain","Bad JSON"); return;} int idx=d["index"]|-1; int minutes=d["minutes"]|0; if(idx>=0&&idx<ROOM_COUNT&&minutes>0) rooms[idx].boostUntil=millis()+(unsigned long)minutes*60000UL; server.send(200,"application/json","{\"ok\":true}"); }
+
+/*********************************** BLOK H – STATIC OBSAH & ROUTING ************************/
+void handleIndex(){ addCORS(); server.send_P(200,"text/html",INDEX_HTML); }
+void handleFavicon(){ server.send(204,"text/plain",""); }
+void handleOptions(){ addCORS(); server.send(200,"text/plain",""); }
+
+/*********************************** BLOK I – SETUP & LOOP **********************************/
+void setup(){ Serial.begin(115200); pinMode(BOILER_RELAY,OUTPUT); digitalWrite(BOILER_RELAY,LOW); initHistory(); WiFi.mode(WIFI_AP); WiFi.softAP("ESP32_HeatingHub","12345678"); delay(120); Serial.print("AP běží na: http://"); Serial.println(WiFi.softAPIP()); server.on("/",HTTP_GET,handleIndex); server.on("/favicon.ico",HTTP_GET,handleFavicon); server.on("/api/state",HTTP_GET,apiState); server.on("/api/set_room",HTTP_POST,apiSetRoom); server.on("/api/boiler/toggle",HTTP_POST,apiToggleBoiler); server.on("/api/comfort_band",HTTP_POST,apiComfort); server.on("/api/boost",HTTP_POST,apiBoost); server.onNotFound([](){ if(server.method()==HTTP_OPTIONS) handleOptions(); else server.send(404,"text/plain","Not found"); }); server.begin(); uptimeStart=millis(); }
+void loop(){ server.handleClient(); unsigned long t=millis(); if(t-lastSim>=750){ simulateTemperatures(); lastSim=t; } if(t-lastLogic>=1000){ evaluateBoiler(); lastLogic=t; } }
