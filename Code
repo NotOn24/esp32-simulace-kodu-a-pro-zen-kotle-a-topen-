@@ -14,6 +14,7 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <ArduinoJson.h>
+#include <math.h>
 
 // ===== Konfigurace =====
 #define BOILER_RELAY 5                  // výstup pro kotel (simulace – jen log. stav)
@@ -207,7 +208,61 @@ bool  boilerOn=false; bool pumpOn=false; float boilerTemp=45.0f; float comfortBa
 unsigned long uptimeStart=0,lastSim=0,lastLogic=0;
 
 /*********************************** BLOK E – POMOCNÉ FUNKCE ********************************/
-static inline float clampf(float v,float a,float b){return v<a?a:(v>b?b:v);} 
+static inline float clampf(float v,float a,float b){return v<a?a:(v>b?b:v);}
+static bool readBoundedFloat(const JsonVariantConst &src,float minVal,float maxVal,float &out,bool clamp){
+  if(src.isNull()) return false;
+  if(!(src.is<float>()||src.is<double>()||src.is<int>()||src.is<long>())) return false;
+  float raw=src.as<float>();
+  if(isnan(raw)||isinf(raw)) return false;
+  if(raw<minVal){
+    if(!clamp) return false;
+    raw=minVal;
+  }else if(raw>maxVal){
+    if(!clamp) return false;
+    raw=maxVal;
+  }
+  out=raw;
+  return true;
+}
+static bool readBoundedInt(const JsonVariantConst &src,int minVal,int maxVal,int &out,bool clamp){
+  if(src.isNull()) return false;
+  long value=0;
+  if(src.is<bool>()){
+    value=src.as<bool>()?1:0;
+  }else if(src.is<int>()||src.is<long>()){
+    value=src.as<long>();
+  }else if(src.is<float>()||src.is<double>()){
+    float raw=src.as<float>();
+    if(isnan(raw)||isinf(raw)) return false;
+    long rounded=(long)raw;
+    if(fabsf(raw-(float)rounded)>0.0001f) return false;
+    value=rounded;
+  }else{
+    return false;
+  }
+  if(value<minVal){
+    if(!clamp) return false;
+    value=minVal;
+  }else if(value>maxVal){
+    if(!clamp) return false;
+    value=maxVal;
+  }
+  out=(int)value;
+  return true;
+}
+static bool readStrictBool(const JsonVariantConst &src,bool &out){
+  if(src.isNull()) return false;
+  if(src.is<bool>()){
+    out=src.as<bool>();
+    return true;
+  }
+  if(src.is<int>()||src.is<long>()){
+    long value=src.as<long>();
+    if(value==0){ out=false; return true; }
+    if(value==1){ out=true; return true; }
+  }
+  return false;
+}
 void initHistory(){ for(int i=0;i<ROOM_COUNT;i++) for(int h=0;h<HISTORY_LEN;h++) rooms[i].history[h]=rooms[i].temp; }
 void addCORS(){ server.sendHeader("Access-Control-Allow-Origin","*"); server.sendHeader("Access-Control-Allow-Headers","Content-Type"); server.sendHeader("Access-Control-Allow-Methods","GET,POST,OPTIONS"); }
 
@@ -227,10 +282,10 @@ void evaluateBoiler(){ bool anyOpen=false; for(int i=0;i<ROOM_COUNT;i++) if(room
 
 /*********************************** BLOK G – REST API **************************************/
 void apiState(){ addCORS(); DynamicJsonDocument doc(16384); doc["boiler_on"]=boilerOn; doc["pump_on"]=pumpOn; doc["boiler_temp"]=boilerTemp; doc["comfort_band"]=comfortBand; doc["uptime_ms"]=millis()-uptimeStart; JsonObject net=doc.createNestedObject("net"); net["ssid"]="ESP32_HeatingHub"; net["ip"]=WiFi.softAPIP().toString(); net["rssi"]=-50; JsonArray jRooms=doc.createNestedArray("rooms"); for(int i=0;i<ROOM_COUNT;i++){ JsonObject jr=jRooms.createNestedObject(); jr["name"]=rooms[i].name; jr["temp"]=rooms[i].temp; jr["target"]=rooms[i].target; jr["enabled"]=rooms[i].enabled; jr["heating"]=rooms[i].heating; JsonArray h=jr.createNestedArray("history"); for(int k=0;k<HISTORY_LEN;k++) h.add(rooms[i].history[k]); } String json; serializeJson(doc,json); server.send(200,"application/json",json); }
-void apiSetRoom(){ addCORS(); if(!server.hasArg("plain")){ server.send(400,"text/plain","Missing body"); return;} DynamicJsonDocument d(512); if(deserializeJson(d,server.arg("plain"))){ server.send(400,"text/plain","Bad JSON"); return;} int idx=d["index"]|-1; if(idx<0||idx>=ROOM_COUNT){ server.send(400,"text/plain","Bad index"); return;} if(d.containsKey("name")) rooms[idx].name=(const char*)d["name"]; if(d.containsKey("target")) rooms[idx].target=d["target"].as<float>(); if(d.containsKey("enabled")) rooms[idx].enabled=d["enabled"].as<bool>(); server.send(200,"application/json","{\"ok\":true}"); }
+void apiSetRoom(){ addCORS(); if(!server.hasArg("plain")){ server.send(400,"text/plain","Missing body"); return;} DynamicJsonDocument d(512); if(deserializeJson(d,server.arg("plain"))){ server.send(400,"text/plain","Bad JSON"); return;} int idx=d["index"]|-1; if(idx<0||idx>=ROOM_COUNT){ server.send(400,"text/plain","Bad index"); return;} if(d.containsKey("name")) rooms[idx].name=(const char*)d["name"]; float newTarget; if(readBoundedFloat(d["target"],10.0f,30.0f,newTarget,true)) rooms[idx].target=newTarget; bool newEnabled; if(readStrictBool(d["enabled"],newEnabled)){ rooms[idx].enabled=newEnabled; if(!newEnabled){ rooms[idx].heating=false; rooms[idx].boostUntil=0; } } server.send(200,"application/json","{\"ok\":true}"); }
 void apiToggleBoiler(){ addCORS(); boilerOn=!boilerOn; pumpOn=boilerOn; server.send(200,"application/json","{\"ok\":true}"); }
-void apiComfort(){ addCORS(); if(!server.hasArg("plain")){ server.send(400,"text/plain","Missing body"); return;} DynamicJsonDocument d(256); if(deserializeJson(d,server.arg("plain"))){ server.send(400,"text/plain","Bad JSON"); return;} comfortBand=d["value"].as<float>(); server.send(200,"application/json","{\"ok\":true}"); }
-void apiBoost(){ addCORS(); if(!server.hasArg("plain")){ server.send(400,"text/plain","Missing body"); return;} DynamicJsonDocument d(256); if(deserializeJson(d,server.arg("plain"))){ server.send(400,"text/plain","Bad JSON"); return;} int idx=d["index"]|-1; int minutes=d["minutes"]|0; if(idx>=0&&idx<ROOM_COUNT&&minutes>0) rooms[idx].boostUntil=millis()+(unsigned long)minutes*60000UL; server.send(200,"application/json","{\"ok\":true}"); }
+void apiComfort(){ addCORS(); if(!server.hasArg("plain")){ server.send(400,"text/plain","Missing body"); return;} DynamicJsonDocument d(256); if(deserializeJson(d,server.arg("plain"))){ server.send(400,"text/plain","Bad JSON"); return;} float newBand; if(!readBoundedFloat(d["value"],0.0f,5.0f,newBand,false)){ server.send(400,"text/plain","Invalid value"); return;} comfortBand=newBand; server.send(200,"application/json","{\"ok\":true}"); }
+void apiBoost(){ addCORS(); if(!server.hasArg("plain")){ server.send(400,"text/plain","Missing body"); return;} DynamicJsonDocument d(256); if(deserializeJson(d,server.arg("plain"))){ server.send(400,"text/plain","Bad JSON"); return;} int idx=d["index"]|-1; if(idx<0||idx>=ROOM_COUNT){ server.send(400,"text/plain","Bad index"); return;} int minutes; if(!readBoundedInt(d["minutes"],1,240,minutes,false)){ server.send(400,"text/plain","Invalid minutes"); return;} rooms[idx].boostUntil=millis()+(unsigned long)minutes*60000UL; server.send(200,"application/json","{\"ok\":true}"); }
 
 /*********************************** BLOK H – STATIC OBSAH & ROUTING ************************/
 void handleIndex(){ addCORS(); server.send_P(200,"text/html",INDEX_HTML); }
