@@ -1,0 +1,1 @@
+# esp32-simulace-kodu-a-pro-zen-kotle-a-topen-
